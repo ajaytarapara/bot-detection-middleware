@@ -5,6 +5,8 @@ using BotDetector.Business.Rules;
 using BotDetector.Business.Services;
 using BotDetector.Infrastructure.Implementation;
 using BotDetector.Infrastructure.Logging;
+using BotDetector.Infrastructure.Redis;
+using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddControllers();
@@ -19,6 +21,9 @@ builder.Services.Configure<DetectionThresholds>(
 builder.Services.Configure<RuleWeightsOptions>(
     builder.Configuration.GetSection("RuleWeights"));
 
+builder.Services.Configure<TrafficClassificationOptions>(
+    builder.Configuration.GetSection("TrafficClassification"));
+
 builder.Services.Configure<RateLimitOptions>(
     builder.Configuration.GetSection("RateLimitOptions"));
 
@@ -30,7 +35,14 @@ builder.Services.AddScoped<IDetectionEngine, DetectionEngine>();
 
 builder.Services.AddMemoryCache();
 
-builder.Services.AddScoped<IRateLimiter, InMemoryRateLimiter>();
+builder.Services.AddHealthChecks();
+
+builder.Services.AddScoped<InMemoryRateLimiter>();
+builder.Services.AddScoped<IRateLimiter, RedisRateLimiter>(sp =>
+    new RedisRateLimiter(
+        sp.GetRequiredService<InMemoryRateLimiter>(),
+        sp.GetRequiredService<IOptions<RateLimitOptions>>(),
+        sp.GetRequiredService<ILogger<RedisRateLimiter>>()));
 
 builder.Services.AddScoped<IDetectionRule, RateLimitRule>();
 
@@ -49,5 +61,6 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 app.UseBotDetection();
+app.MapHealthChecks("/health");
 app.MapControllers();
 app.Run();

@@ -4,7 +4,10 @@ using System.Linq;
 using System.Threading.Tasks;
 using BotDetector.Business.Interfaces;
 using BotDetector.Business.Models;
+using BotDetector.Business.Configurations;
+using BotDetector.Business.Services;
 using BotDetector.Common.Enums;
+using Microsoft.Extensions.Options;
 
 namespace BotDetector.API.Middleware
 {
@@ -20,13 +23,16 @@ namespace BotDetector.API.Middleware
             _next = next;
             _logger = logger;
         }
+
         public async Task InvokeAsync(
             HttpContext context,
             ITrafficClassifier trafficClassifier,
             IDetectionEngine detectionEngine,
-            IAuditLogger auditLogger)
+            IAuditLogger auditLogger,
+            IOptions<TrafficClassificationOptions> trafficOptions)
         {
-            var requestContext = BuildRequestContext(context);
+            var options = trafficOptions.Value;
+            var requestContext = BuildRequestContext(context, options);
 
             var classification =
                 await trafficClassifier.ClassifyAsync(requestContext);
@@ -47,19 +53,30 @@ namespace BotDetector.API.Middleware
                     Message = "Blocked - Known Abuser"
                 });
 
+                // Audit log for known abuser
+                await auditLogger.LogAsync(
+                    new RequestAudit
+                    {
+                        IpAddress = MaskIpAddress(requestContext.IpAddress),
+                        Path = requestContext.Path,
+                        Method = requestContext.Method,
+                        Score = 100,
+                        Action = BotAction.Block.ToString(),
+                        Reasons = new List<string> { "IP blocklist match" },
+                        TimestampUtc = DateTime.UtcNow
+                    });
+
                 return;
             }
 
             var detectionResult =
                 await detectionEngine.AnalyzeAsync(requestContext);
-            Console.WriteLine(
-                System.Text.Json.JsonSerializer.Serialize(
-                    detectionResult));
-            // Audit Log
+
+            // Audit Log (PII Sanitized)
             await auditLogger.LogAsync(
                 new RequestAudit
                 {
-                    IpAddress = requestContext.IpAddress,
+                    IpAddress = MaskIpAddress(requestContext.IpAddress),
                     Path = requestContext.Path,
                     Method = requestContext.Method,
                     Score = detectionResult.TotalScore,
@@ -69,8 +86,11 @@ namespace BotDetector.API.Middleware
                 });
 
             _logger.LogInformation(
-                "Bot Detection Result: {@DetectionResult}",
-                detectionResult);
+                "Bot Detection Result: Action={Action}, Score={Score}, ClientIp={ClientIp}, Reasons={Reasons}",
+                detectionResult.Action,
+                detectionResult.TotalScore,
+                MaskIpAddress(requestContext.IpAddress),
+                string.Join(", ", detectionResult.Reasons));
 
             var stopPipeline =
                 await HandleAction(context, detectionResult);
@@ -82,13 +102,16 @@ namespace BotDetector.API.Middleware
 
             await _next(context);
         }
+
         private BotRequestContext BuildRequestContext(
-               HttpContext context)
+               HttpContext context,
+               TrafficClassificationOptions options)
         {
+            var clientIp = GetClientIp(context, options);
+
             return new BotRequestContext
             {
-                IpAddress =
-                    context.Connection.RemoteIpAddress?.ToString() ?? string.Empty,
+                IpAddress = clientIp,
 
                 UserAgent =
                     context.Request.Headers["User-Agent"].ToString(),
@@ -109,6 +132,80 @@ namespace BotDetector.API.Middleware
                             h => h.Value.ToString())
             };
         }
+
+        private string GetClientIp(HttpContext context, TrafficClassificationOptions options)
+        {
+            var remoteIp = context.Connection.RemoteIpAddress?.ToString() ?? string.Empty;
+
+            // Strip port if present in remoteIp
+            int colonIndex = remoteIp.LastIndexOf(':');
+            if (colonIndex > 0 && remoteIp.Count(c => c == ':') == 1)
+            {
+                remoteIp = remoteIp.Substring(0, colonIndex);
+            }
+
+            if (!context.Request.Headers.TryGetValue("X-Forwarded-For", out var forwardedFor) || string.IsNullOrWhiteSpace(forwardedFor))
+            {
+                return remoteIp;
+            }
+
+            var ips = forwardedFor.ToString()
+                .Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(ip => ip.Trim())
+                .ToList();
+
+            if (!ips.Any())
+            {
+                return remoteIp;
+            }
+
+            // Check if the immediate connection proxy is trusted
+            if (options.TrustedProxies.Any(proxy => TrafficClassifier.IsIpInCidr(remoteIp, proxy)))
+            {
+                // Traverse proxy chain from right to left
+                for (int i = ips.Count - 1; i >= 0; i--)
+                {
+                    var currentIp = ips[i];
+                    if (i == 0)
+                    {
+                        return currentIp; // Client IP
+                    }
+
+                    if (!options.TrustedProxies.Any(proxy => TrafficClassifier.IsIpInCidr(currentIp, proxy)))
+                    {
+                        return currentIp; // Client IP
+                    }
+                }
+            }
+
+            return remoteIp;
+        }
+
+        private string MaskIpAddress(string ipAddress)
+        {
+            if (string.IsNullOrEmpty(ipAddress)) return string.Empty;
+
+            if (ipAddress.Contains('.'))
+            {
+                var parts = ipAddress.Split('.');
+                if (parts.Length >= 4)
+                {
+                    return $"{parts[0]}.{parts[1]}.xxx.xxx";
+                }
+            }
+
+            if (ipAddress.Contains(':'))
+            {
+                var parts = ipAddress.Split(':');
+                if (parts.Length >= 2)
+                {
+                    return $"{parts[0]}:{parts[1]}:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx";
+                }
+            }
+
+            return "xxx.xxx.xxx.xxx";
+        }
+
         private async Task<bool> HandleAction(
                HttpContext context,
                DetectionResult result)
@@ -119,15 +216,12 @@ namespace BotDetector.API.Middleware
                     return false;
 
                 case BotAction.Shadow:
-
                     _logger.LogWarning(
                         "Shadow traffic detected. Score: {Score}",
                         result.TotalScore);
-
                     return false;
 
                 case BotAction.Challenge:
-
                     context.Response.StatusCode =
                         StatusCodes.Status403Forbidden;
 
@@ -136,7 +230,6 @@ namespace BotDetector.API.Middleware
                         Challenge = true,
                         Message = "Verification Required"
                     });
-
                     return true;
 
                 case BotAction.Throttle:
@@ -147,11 +240,9 @@ namespace BotDetector.API.Middleware
                     {
                         Message = "Too Many Requests"
                     });
-
                     return true;
 
                 case BotAction.Block:
-
                     context.Response.StatusCode =
                         StatusCodes.Status403Forbidden;
 
@@ -159,7 +250,18 @@ namespace BotDetector.API.Middleware
                     {
                         Message = "Blocked"
                     });
+                    return true;
 
+                case BotAction.Tarpit:
+                    _logger.LogWarning("Tarpitting connection. Applying artificial delay.");
+                    await Task.Delay(5000); // 5 seconds delay to waste bot resources
+                    context.Response.StatusCode =
+                        StatusCodes.Status403Forbidden;
+
+                    await context.Response.WriteAsJsonAsync(new
+                    {
+                        Message = "Blocked"
+                    });
                     return true;
 
                 default:

@@ -14,5 +14,11 @@ namespace BotDetector.Business.Configurations
         public List<string> VerifiedBotUserAgents { get; set; } = new();
 
         public List<string> BlockedIps { get; set; } = new();
+
+        public List<string> TrustedIps { get; set; } = new();
+
+        public List<string> TrustedProxies { get; set; } = new();
+
+        public string ApiKeyHeader { get; set; } = "X-API-Key";
     }
 }
