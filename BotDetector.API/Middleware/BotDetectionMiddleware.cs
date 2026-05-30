@@ -31,73 +31,82 @@ namespace BotDetector.API.Middleware
             IAuditLogger auditLogger,
             IOptions<TrafficClassificationOptions> trafficOptions)
         {
-            var options = trafficOptions.Value;
-            var requestContext = BuildRequestContext(context, options);
-
-            var classification =
-                await trafficClassifier.ClassifyAsync(requestContext);
-
-            if (classification.BypassDetection)
+            BotRequestContext? requestContext = null;
+            try
             {
-                await _next(context);
-                return;
-            }
+                var options = trafficOptions.Value;
+                requestContext = BuildRequestContext(context, options);
 
-            if (classification.TrafficType == TrafficType.KnownAbuser)
-            {
-                context.Response.StatusCode =
-                    StatusCodes.Status403Forbidden;
+                var classification =
+                    await trafficClassifier.ClassifyAsync(requestContext);
 
-                await context.Response.WriteAsJsonAsync(new
+                if (classification.BypassDetection)
                 {
-                    Message = "Blocked - Known Abuser"
-                });
+                    await _next(context);
+                    return;
+                }
 
-                // Audit log for known abuser
+                if (classification.TrafficType == TrafficType.KnownAbuser)
+                {
+                    context.Response.StatusCode =
+                        StatusCodes.Status403Forbidden;
+
+                    await context.Response.WriteAsJsonAsync(new
+                    {
+                        Message = "Blocked - Known Abuser"
+                    });
+
+                    // Audit log for known abuser
+                    await auditLogger.LogAsync(
+                        new RequestAudit
+                        {
+                            IpAddress = MaskIpAddress(requestContext.IpAddress),
+                            Path = requestContext.Path,
+                            Method = requestContext.Method,
+                            Score = 100,
+                            Action = BotAction.Block.ToString(),
+                            Reasons = new List<string> { "IP blocklist match" },
+                            TimestampUtc = DateTime.UtcNow
+                        });
+
+                    return;
+                }
+
+                var detectionResult =
+                    await detectionEngine.AnalyzeAsync(requestContext);
+
+                // Audit Log (PII Sanitized)
                 await auditLogger.LogAsync(
                     new RequestAudit
                     {
                         IpAddress = MaskIpAddress(requestContext.IpAddress),
                         Path = requestContext.Path,
                         Method = requestContext.Method,
-                        Score = 100,
-                        Action = BotAction.Block.ToString(),
-                        Reasons = new List<string> { "IP blocklist match" },
+                        Score = detectionResult.TotalScore,
+                        Action = detectionResult.Action.ToString(),
+                        Reasons = detectionResult.Reasons,
                         TimestampUtc = DateTime.UtcNow
                     });
 
-                return;
-            }
+                _logger.LogInformation(
+                    "Bot Detection Result: Action={Action}, Score={Score}, ClientIp={ClientIp}, Reasons={Reasons}",
+                    detectionResult.Action,
+                    detectionResult.TotalScore,
+                    MaskIpAddress(requestContext.IpAddress),
+                    string.Join(", ", detectionResult.Reasons));
 
-            var detectionResult =
-                await detectionEngine.AnalyzeAsync(requestContext);
+                var stopPipeline =
+                    await HandleAction(context, detectionResult);
 
-            // Audit Log (PII Sanitized)
-            await auditLogger.LogAsync(
-                new RequestAudit
+                if (stopPipeline)
                 {
-                    IpAddress = MaskIpAddress(requestContext.IpAddress),
-                    Path = requestContext.Path,
-                    Method = requestContext.Method,
-                    Score = detectionResult.TotalScore,
-                    Action = detectionResult.Action.ToString(),
-                    Reasons = detectionResult.Reasons,
-                    TimestampUtc = DateTime.UtcNow
-                });
-
-            _logger.LogInformation(
-                "Bot Detection Result: Action={Action}, Score={Score}, ClientIp={ClientIp}, Reasons={Reasons}",
-                detectionResult.Action,
-                detectionResult.TotalScore,
-                MaskIpAddress(requestContext.IpAddress),
-                string.Join(", ", detectionResult.Reasons));
-
-            var stopPipeline =
-                await HandleAction(context, detectionResult);
-
-            if (stopPipeline)
+                    return;
+                }
+            }
+            catch (Exception ex)
             {
-                return;
+                // FAIL SAFE: Log exception but proceed to prevent breaking the API.
+                _logger.LogError(ex, "BotDetectionMiddleware error. Continuing request pipeline safely.");
             }
 
             await _next(context);
