@@ -21,8 +21,12 @@ namespace BotDetector.Infrastructure.Logging
         public Task LogAsync(RequestAudit audit)
         {
             _logger.LogInformation(
-                "Bot Audit {@Audit}",
-                audit);
+                "Bot Audit - IP={IpAddress} Path={Path} Score={Score} Action={Action} Reasons={Reasons}",
+                audit.IpAddress,
+                audit.Path,
+                audit.Score,
+                audit.Action,
+                string.Join(", ", audit.Reasons));
 
             return Task.CompletedTask;
         }
